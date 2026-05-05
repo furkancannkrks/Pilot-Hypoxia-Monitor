@@ -3,10 +3,10 @@
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
 
-// ————— DURUM MAKİNESİ —————
-enum Durum { NORMAL, ONLEYICI_UYARI, KRITIK_ACIL, SENSOR_HATASI };
+// ————— STATE MACHINE —————
+enum State { NORMAL, PREVENTIVE_WARNING, CRITICAL_EMERGENCY, SENSOR_FAULT };
 
-// ————— PİNLER —————
+// ————— PINS —————
 #define LED_PIN  2
 #define INT_MPU  18
 
@@ -25,52 +25,52 @@ int8_t  hrValid;
 
 // ————— MPU6050 —————
 #define MPU_ADDR 0x68
-volatile bool mpuVeriHazir = false;
-float egimKalibrasyonu = 0;
+volatile bool mpuDataReady = false;
+float tiltCalibration = 0;
 
-// ————— EŞİK DEĞERLERİ —————
-#define SPO2_KRITIK      60.0
-#define BASINC_DUSUS     0001.0
-#define BAS_EGIMI_KRITIK 30.0
+// ————— THRESHOLDS —————
+#define SPO2_CRITICAL      60.0
+#define PRESSURE_DROP      0.001
+#define HEAD_TILT_CRITICAL 30.0
 
-// ————— HAREKETLİ ORTALAMA (Basınç filtresi) —————
+// ————— MOVING AVERAGE (Pressure filter) —————
 #define FILTER_SIZE 10
-float basincBuffer[FILTER_SIZE];
-int   basincIndex = 0;
-bool  basincDolu  = false;
+float pressureBuffer[FILTER_SIZE];
+int   pressureIndex = 0;
+bool  pressureFull  = false;
 
-float basincFiltrele(float yeniDeger) {
-  basincBuffer[basincIndex] = yeniDeger;
-  basincIndex = (basincIndex + 1) % FILTER_SIZE;
-  if (basincIndex == 0) basincDolu = true;
-  int sayi = basincDolu ? FILTER_SIZE : basincIndex;
-  float toplam = 0;
-  for (int i = 0; i < sayi; i++) toplam += basincBuffer[i];
-  return toplam / sayi;
+float filterPressure(float newValue) {
+  pressureBuffer[pressureIndex] = newValue;
+  pressureIndex = (pressureIndex + 1) % FILTER_SIZE;
+  if (pressureIndex == 0) pressureFull = true;
+  int count = pressureFull ? FILTER_SIZE : pressureIndex;
+  float sum = 0;
+  for (int i = 0; i < count; i++) sum += pressureBuffer[i];
+  return sum / count;
 }
 
 // ————— NON-BLOCKING LED —————
-unsigned long ledOncekiZaman = 0;
-bool ledDurum = false;
-int ledYanipSonmeHizi = 0;
+unsigned long ledPreviousTime = 0;
+bool ledState = false;
+int ledBlinkRate = 0;
 
-void ledGuncelle() {
-  if (ledYanipSonmeHizi == -1) { digitalWrite(LED_PIN, HIGH); return; }
-  if (ledYanipSonmeHizi ==  0) { digitalWrite(LED_PIN, LOW);  return; }
-  unsigned long simdi = millis();
-  if (simdi - ledOncekiZaman >= (unsigned long)ledYanipSonmeHizi) {
-    ledOncekiZaman = simdi;
-    ledDurum = !ledDurum;
-    digitalWrite(LED_PIN, ledDurum);
+void updateLed() {
+  if (ledBlinkRate == -1) { digitalWrite(LED_PIN, HIGH); return; }
+  if (ledBlinkRate ==  0) { digitalWrite(LED_PIN, LOW);  return; }
+  unsigned long currentTime = millis();
+  if (currentTime - ledPreviousTime >= (unsigned long)ledBlinkRate) {
+    ledPreviousTime = currentTime;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
   }
 }
 
 // ————— MPU6050 INTERRUPT —————
 void IRAM_ATTR mpuInterrupt() {
-  mpuVeriHazir = true;
+  mpuDataReady = true;
 }
 
-// ————— MPU6050 FONKSİYONLARI —————
+// ————— MPU6050 FUNCTIONS —————
 void initMpu6050() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
@@ -78,13 +78,13 @@ void initMpu6050() {
   Wire.endTransmission();
   delay(100);
 
-  // Örnekleme hızı bölen: 19 → 1000/(1+19) = 50Hz
+  // Sample rate divider: 19 → 1000/(1+19) = 50Hz
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x19); // SMPLRT_DIV
   Wire.write(0x13);
   Wire.endTransmission();
 
-  // Düşük geçiren filtre aktif
+  // Low-pass filter active
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x1A); // CONFIG
   Wire.write(0x03); // 44Hz LPF
@@ -114,39 +114,39 @@ void readMpu6050(float &ax, float &ay, float &az) {
   az = raw_az / 16384.0;
 }
 
-float hesaplaEgim(float ax, float ay, float az) {
+float calculateTilt(float ax, float ay, float az) {
   return atan2(sqrt(ax*ax + ay*ay), az) * 180.0 / PI;
 }
 
-// ————— ÇAPRAZ DOĞRULAMA (Güvenli Havacılık Mantığı) —————
-Durum caprazDogrula(float spo2, bool spo2Gecerli, float basincDusus, float egim) {
-  if (!spo2Gecerli) {
+// ————— CROSS-VALIDATION (Safe Aviation Logic) —————
+State crossValidate(float spo2, bool isSpo2Valid, float pressureDrop, float tilt) {
+  if (!isSpo2Valid) {
     Serial.println("[STATUS] SENSOR ERROR: SpO2 measurement invalid, check the sensor!");
-    return SENSOR_HATASI;
+    return SENSOR_FAULT;
   }
 
-  bool spo2Kritik   = spo2 < SPO2_KRITIK;
-  bool basincKritik = basincDusus > BASINC_DUSUS;
-  bool egimKritik   = egim > BAS_EGIMI_KRITIK;
+  bool isSpo2Critical     = spo2 < SPO2_CRITICAL;
+  bool isPressureCritical = pressureDrop > PRESSURE_DROP;
+  bool isTiltCritical     = tilt > HEAD_TILT_CRITICAL;
 
-  // SEVİYE 2 (KABİN ALARMI): Eğim KESİNLİKLE bozulmuş olmalı VE yanında bir risk olmalı.
-  // Yani: (Baş düştü VE Oksijen azaldı) VEYA (Baş düştü VE Basınç azaldı)
-  if (egimKritik && (spo2Kritik || basincKritik)) {
-    return KRITIK_ACIL;
+  // STAGE 2 (CABIN ALARM): Tilt MUST BE critical AND there must be a risk alongside it.
+  // Meaning: (Head tilt AND Oxygen dropped) OR (Head tilt AND Pressure dropped)
+  if (isTiltCritical && (isSpo2Critical || isPressureCritical)) {
+    return CRITICAL_EMERGENCY;
   }
 
-  // SEVİYE 1 (PİLOTA UYARI): Oksijen veya Basınç düşmüş ama BAŞ DİMDİK (Pilot uyanık)
-  if (spo2Kritik || basincKritik) {
-    return ONLEYICI_UYARI;
+  // STAGE 1 (PILOT WARNING): Oxygen or Pressure dropped but HEAD UPRIGHT (Pilot is conscious)
+  if (isSpo2Critical || isPressureCritical) {
+    return PREVENTIVE_WARNING;
   }
 
-  // Sadece baş eğimi varsa (Aşağı bakıyorsa) veya her şey normalse
+  // If only head is tilted (looking down) or everything is normal
   return NORMAL;
 }
 
-// ————— GLOBAL ZAMANLAR —————
-float oncekiBasincFiltreli = 0;
-unsigned long oncekiZaman  = 0;
+// ————— GLOBAL TIMING & VARIABLES —————
+float previousFilteredPressure = 0;
+unsigned long previousTime  = 0;
 
 // ————— SETUP —————
 void setup() {
@@ -177,14 +177,14 @@ void setup() {
   }
   particleSensor.setup(60, 4, 2, 100, 411, 4096);
 
-  // İlk basınç
-  float ilkBasinc = bmp.readPressure() / 100.0;
-  for (int i = 0; i < FILTER_SIZE; i++) basincBuffer[i] = ilkBasinc;
-  basincDolu = true;
-  oncekiBasincFiltreli = ilkBasinc;
-  oncekiZaman = millis();
+  // Initial pressure
+  float initialPressure = bmp.readPressure() / 100.0;
+  for (int i = 0; i < FILTER_SIZE; i++) pressureBuffer[i] = initialPressure;
+  pressureFull = true;
+  previousFilteredPressure = initialPressure;
+  previousTime = millis();
 
-  // MAX30102 kalibrasyon
+  // MAX30102 calibration
   Serial.println("Calibration starting, please attach the oxygen sensor...");
   for (int i = 0; i < BUFFER_LENGTH; i++) {
     while (!particleSensor.available()) particleSensor.check();
@@ -195,11 +195,11 @@ void setup() {
   maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_LENGTH, redBuffer,
                                           &spo2Val, &spo2Valid, &heartRate, &hrValid);
 
-  // MPU6050 eğim kalibrasyonu
-  float kax, kay, kaz;
-  readMpu6050(kax, kay, kaz);
-  egimKalibrasyonu = hesaplaEgim(kax, kay, kaz);
-  Serial.print("Initial tilt angle: "); Serial.print(egimKalibrasyonu); Serial.println(" degrees");
+  // MPU6050 tilt calibration
+  float cax, cay, caz;
+  readMpu6050(cax, cay, caz);
+  tiltCalibration = calculateTilt(cax, cay, caz);
+  Serial.print("Initial tilt angle: "); Serial.print(tiltCalibration); Serial.println(" degrees");
 
   Serial.println("Calibration completed! System ready.");
   Serial.println("========================================");
@@ -207,7 +207,7 @@ void setup() {
 
 // ————— LOOP —————
 void loop() {
-  // ——— MAX30102 buffer güncelle ———
+  // ——— Update MAX30102 buffer ———
   for (int i = 25; i < BUFFER_LENGTH; i++) {
     redBuffer[i - 25] = redBuffer[i];
     irBuffer[i - 25]  = irBuffer[i];
@@ -220,68 +220,73 @@ void loop() {
   }
   maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_LENGTH, redBuffer,
                                           &spo2Val, &spo2Valid, &heartRate, &hrValid);
-  bool parmakVar = (irBuffer[BUFFER_LENGTH-1] > 30000);
+                                          
+  // Using Tissue Contact logic as we discussed
+  bool hasTissueContact = (irBuffer[BUFFER_LENGTH-1] > 30000);
 
   // ——— BMP280 ———
-  float basincHam      = bmp.readPressure() / 100.0;
-  float basincFiltreli = basincFiltrele(basincHam);
-  float sicaklik       = bmp.readTemperature();
+  float rawPressure      = bmp.readPressure() / 100.0;
+  float filteredPressure = filterPressure(rawPressure);
+  float temperature      = bmp.readTemperature();
 
-  unsigned long simdi  = millis();
-  float gecenSure      = (simdi - oncekiZaman) / 1000.0;
-  if (gecenSure <= 0.001) gecenSure = 0.001; // SIFIRA BÖLME HATASINI ENGELLER
-  float basincDusus    = (oncekiBasincFiltreli - basincFiltreli) / gecenSure;
-  if (basincDusus < 0) basincDusus = 0;
-  oncekiBasincFiltreli = basincFiltreli;
-  oncekiZaman          = simdi;
+  unsigned long currentTime = millis();
+  float elapsedTime         = (currentTime - previousTime) / 1000.0;
+  
+  if (elapsedTime <= 0.001) elapsedTime = 0.001; // PREVENTS DIVIDE BY ZERO ERROR
+  
+  float currentPressureDrop = (previousFilteredPressure - filteredPressure) / elapsedTime;
+  if (currentPressureDrop < 0) currentPressureDrop = 0;
+  
+  previousFilteredPressure = filteredPressure;
+  previousTime             = currentTime;
 
-  // ——— MPU6050: Sadece interrupt geldiyse oku ———
+  // ——— MPU6050: Read only if interrupt occurred ———
   static float ax = 0, ay = 0, az = 0;
-  if (mpuVeriHazir) {
-    mpuVeriHazir = false;
+  if (mpuDataReady) {
+    mpuDataReady = false;
     readMpu6050(ax, ay, az);
   }
-  float egim = abs(hesaplaEgim(ax, ay, az) - egimKalibrasyonu);
+  float tilt = abs(calculateTilt(ax, ay, az) - tiltCalibration);
 
-  // ——— Nabız geçerlilik kontrolü ———
-  bool nabizGecerli = (hrValid == 1 && parmakVar && heartRate > 40 && heartRate < 180);
+  // ——— Pulse validity check ———
+  bool isPulseValid = (hrValid == 1 && hasTissueContact && heartRate > 40 && heartRate < 180);
 
-  // ——— ÇAPRAZ DOĞRULAMA ———
-  Durum durum = caprazDogrula((float)spo2Val, spo2Valid == 1 && parmakVar, basincDusus, egim);
+  // ——— CROSS-VALIDATION ———
+  State currentState = crossValidate((float)spo2Val, spo2Valid == 1 && hasTissueContact, currentPressureDrop, tilt);
 
   // ——— LED ———
-  switch(durum) {
-    case NORMAL:         ledYanipSonmeHizi = 0;   break;
-    case ONLEYICI_UYARI: ledYanipSonmeHizi = 25; break;
-    case KRITIK_ACIL:    ledYanipSonmeHizi = 2; break;
-    case SENSOR_HATASI:  ledYanipSonmeHizi = -1;  break;
+  switch(currentState) {
+    case NORMAL:             ledBlinkRate = 0;   break;
+    case PREVENTIVE_WARNING: ledBlinkRate = 25;  break;
+    case CRITICAL_EMERGENCY: ledBlinkRate = 2;   break;
+    case SENSOR_FAULT:       ledBlinkRate = -1;  break;
   }
-  ledGuncelle();
+  updateLed();
 
-  // ——— SERIAL ÇIKTI ———
+  // ——— SERIAL OUTPUT ———
   Serial.println("=== SENSOR DATA ===");
-  Serial.print("[BMP280]   Temperature: "); Serial.print(sicaklik);
-  Serial.print(" C  |  Pressure: "); Serial.print(basincFiltreli); Serial.println(" hPa");
-  Serial.print("[MPU6050]  Head Tilt: "); Serial.print(egim); Serial.println(" degrees");
+  Serial.print("[BMP280]   Temperature: "); Serial.print(temperature);
+  Serial.print(" C  |  Pressure: "); Serial.print(filteredPressure); Serial.println(" hPa");
+  Serial.print("[MPU6050]  Head Tilt: "); Serial.print(tilt); Serial.println(" degrees");
   Serial.print("[MAX30102] SpO2: ");
-  if (spo2Valid == 1 && parmakVar) { Serial.print(spo2Val); Serial.println(" %"); }
+  if (spo2Valid == 1 && hasTissueContact) { Serial.print(spo2Val); Serial.println(" %"); }
   else Serial.println("Invalid - Sensor disconnection.");
   Serial.print("[MAX30102] Pulse: ");
-  if (nabizGecerli) { Serial.print(heartRate); Serial.println(" bpm"); }
+  if (isPulseValid) { Serial.print(heartRate); Serial.println(" bpm"); }
   else Serial.println("Invalid");
 
   Serial.print("[STATUS] ");
-  switch(durum) {
+  switch(currentState) {
     case NORMAL:         
       Serial.println("NORMAL - Flight is safe, values are stable."); 
       break;
-    case ONLEYICI_UYARI: 
+    case PREVENTIVE_WARNING: 
       Serial.println("*** STAGE 1 (PILOT WARNING) - Values are dropping! Put on your oxygen mask!"); 
       break;
-    case KRITIK_ACIL:    
+    case CRITICAL_EMERGENCY:    
       Serial.println("!!! STAGE 2 (CABIN CREW ALERT) !!! - Pilot has lost consciousness, EMERGENCY INTERVENTION!"); 
       break;
-    case SENSOR_HATASI:  
+    case SENSOR_FAULT:   
       Serial.println("SENSOR FAULT - Hardware check required."); 
       break;
   }
